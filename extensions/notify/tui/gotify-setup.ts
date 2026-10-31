@@ -1,0 +1,281 @@
+/**
+ * pi-plugins: notify — Gotify Setup TUI Component
+ *
+ * Interactive overlay for setting up Gotify push notifications.
+ * Guides user through server URL, app token, and priority configuration.
+ * Tests connection before saving.
+ */
+
+import type { Theme } from "@earendil-works/pi-coding-agent";
+import type { Component } from "@earendil-works/pi-tui";
+import { matchesKey } from "@earendil-works/pi-tui";
+import { sendGotifyNotification } from "../platforms/gotify.js";
+import { loadConfig, updateConfig } from "../settings.js";
+import { BracketedPasteBuffer, boxInnerWidth, OverlayTheme } from "./theme.js";
+
+type SetupPhase = "instructions" | "server-url" | "app-token" | "priority" | "testing" | "success" | "error" | "test-failed";
+
+/**
+ * Gotify setup overlay component.
+ */
+export class GotifySetupOverlay implements Component {
+  private phase: SetupPhase = "instructions";
+  private serverUrl = "";
+  private appToken = "";
+  private priority = "5";
+  private error: string | null = null;
+  private testError: string | null = null;
+  private paste = new BracketedPasteBuffer();
+  onClose?: () => void;
+  requestRender?: () => void;
+  private overlay = new OverlayTheme();
+
+  constructor() {
+    try {
+      const config = loadConfig();
+      if (config.gotify.serverUrl) this.serverUrl = config.gotify.serverUrl;
+      if (config.gotify.appToken) this.appToken = config.gotify.appToken;
+      if (config.gotify.priority) this.priority = String(config.gotify.priority);
+    } catch (err) {
+      this.phase = "error";
+      this.error = err instanceof Error ? err.message : String(err);
+    }
+  }
+
+  setTheme(theme: Theme): void {
+    this.overlay.setTheme(theme);
+  }
+
+  invalidate(): void {}
+
+  handleInput(data: string): void {
+    switch (this.phase) {
+      case "instructions":
+        if (data === "\r" || data === "\t" || data === " ") {
+          this.phase = this.serverUrl ? "app-token" : "server-url";
+        } else if (matchesKey(data, "escape")) {
+          this.onClose?.();
+        }
+        break;
+
+      case "server-url":
+        this.handleTextInput(data, "server-url", () => {
+          this.phase = "app-token";
+        });
+        break;
+
+      case "app-token":
+        this.handleTextInput(data, "app-token", () => {
+          this.phase = "priority";
+        });
+        break;
+
+      case "priority":
+        if ((data === "\r" || data === "\t") && this.isValidPriority()) {
+          this.testConnection();
+        } else if (matchesKey(data, "escape")) {
+          this.onClose?.();
+        } else if (data === "\x7f" || data === "\b") {
+          this.priority = this.priority.slice(0, -1);
+        } else {
+          const ch = data.replace(/[^\d]/g, "");
+          if (ch && this.priority.length < 2) {
+            this.priority += ch;
+          }
+        }
+        break;
+
+      case "testing":
+        if (matchesKey(data, "escape")) {
+          this.onClose?.();
+        }
+        break;
+
+      case "success":
+      case "error":
+      case "test-failed":
+        if (data === "\r" || data === "\t" || data === " " || matchesKey(data, "escape")) {
+          this.onClose?.();
+        }
+        break;
+    }
+  }
+
+  private handleTextInput(data: string, target: "server-url" | "app-token", onEnter: () => void): void {
+    this.paste.process(
+      data,
+      (pasteContent) => {
+        const trimmed = pasteContent.trim();
+        if (target === "server-url") {
+          this.serverUrl = trimmed;
+        } else {
+          this.appToken = trimmed;
+        }
+      },
+      (chunk) => {
+        if (chunk === "\r" || chunk === "\t") {
+          onEnter();
+        } else if (matchesKey(chunk, "escape")) {
+          this.onClose?.();
+        } else if (chunk === "\x7f" || chunk === "\b") {
+          if (target === "server-url") {
+            this.serverUrl = this.serverUrl.slice(0, -1);
+          } else {
+            this.appToken = this.appToken.slice(0, -1);
+          }
+        } else {
+          if (chunk.startsWith("\x1b[")) return;
+          if (target === "server-url") {
+            this.serverUrl += chunk;
+          } else {
+            this.appToken += chunk;
+          }
+        }
+      },
+    );
+  }
+
+  private isValidPriority(): boolean {
+    const num = parseInt(this.priority, 10);
+    return !Number.isNaN(num) && num >= 1 && num <= 10;
+  }
+
+  private async testConnection(): Promise<void> {
+    this.phase = "testing";
+    this.requestRender?.();
+
+    try {
+      await sendGotifyNotification(this.serverUrl.replace(/\/$/, ""), this.appToken, "Pi — Setup Test", `Gotify configured successfully at ${new Date().toLocaleTimeString()}`, parseInt(this.priority, 10) || 5);
+      this.saveConfig();
+      this.phase = "success";
+      this.requestRender?.();
+      setTimeout(() => this.onClose?.(), 1500);
+    } catch (err) {
+      this.testError = err instanceof Error ? err.message : String(err);
+      this.phase = "test-failed";
+      this.requestRender?.();
+    }
+  }
+
+  private saveConfig(): void {
+    updateConfig({
+      gotify: {
+        enabled: true,
+        serverUrl: this.serverUrl.replace(/\/$/, ""),
+        appToken: this.appToken,
+        priority: parseInt(this.priority, 10) || 5,
+      },
+    });
+  }
+
+  private maskToken(token: string): string {
+    if (token.length <= 8) return token;
+    return token.slice(0, 4) + "•".repeat(token.length - 8) + token.slice(-4);
+  }
+
+  render(width: number): string[] {
+    const innerWidth = boxInnerWidth(width);
+    const lines: string[] = [];
+
+    lines.push(this.overlay.borderLine(innerWidth, "top"));
+    lines.push(this.overlay.frameLine(this.overlay.fg("accent", this.overlay.bold("📡 Gotify Setup")), innerWidth));
+    lines.push(this.overlay.ruleLine(innerWidth));
+
+    switch (this.phase) {
+      case "instructions":
+        lines.push(this.overlay.frameLine(this.overlay.fg("dim", "Set up Gotify push notifications:"), innerWidth));
+        lines.push(this.overlay.frameLine("", innerWidth));
+        lines.push(this.overlay.frameLine(`  ${this.overlay.bold("1.")} Run a Gotify server (or use an existing one)`, innerWidth));
+        lines.push(this.overlay.frameLine(`     ${this.overlay.fg("dim", "See: https://gotify.net/docs/install")}`, innerWidth));
+        lines.push(this.overlay.frameLine("", innerWidth));
+        lines.push(this.overlay.frameLine(`  ${this.overlay.bold("2.")} Open your Gotify web UI`, innerWidth));
+        lines.push(this.overlay.frameLine(`     Go to ${this.overlay.fg("accent", "Apps")} → Create Application`, innerWidth));
+        lines.push(this.overlay.frameLine(`     Copy the ${this.overlay.fg("accent", "app token")}`, innerWidth));
+        lines.push(this.overlay.frameLine("", innerWidth));
+        lines.push(this.overlay.frameLine(`  ${this.overlay.bold("3.")} Enter your server URL and app token below`, innerWidth));
+        if (this.serverUrl) {
+          lines.push(this.overlay.frameLine(`     ${this.overlay.fg("success", "✓")} Server URL pre-filled from existing config`, innerWidth));
+        }
+        if (this.appToken) {
+          lines.push(this.overlay.frameLine(`     ${this.overlay.fg("success", "✓")} App token pre-filled from existing config`, innerWidth));
+        }
+        lines.push(this.overlay.ruleLine(innerWidth));
+        lines.push(this.overlay.frameLine(this.overlay.fg("dim", "enter/tab continue · esc cancel"), innerWidth));
+        break;
+
+      case "server-url":
+        lines.push(this.overlay.frameLine(this.overlay.fg("dim", "Enter your Gotify server URL:"), innerWidth));
+        lines.push(this.overlay.frameLine("", innerWidth));
+        lines.push(this.overlay.frameLine(`  ${this.overlay.fg("accent", this.overlay.bold(this.serverUrl || " "))}${this.overlay.fg("dim", "█")}`, innerWidth));
+        lines.push(this.overlay.frameLine("", innerWidth));
+        lines.push(this.overlay.frameLine(this.overlay.fg("dim", "Example: https://gotify.example.com"), innerWidth));
+        lines.push(this.overlay.ruleLine(innerWidth));
+        lines.push(this.overlay.frameLine(this.overlay.fg("dim", "enter/tab continue · esc cancel"), innerWidth));
+        break;
+
+      case "app-token": {
+        lines.push(this.overlay.frameLine(this.overlay.fg("dim", "Enter your app token:"), innerWidth));
+        lines.push(this.overlay.frameLine("", innerWidth));
+        const displayToken = this.appToken ? this.overlay.fg("accent", this.overlay.bold(this.maskToken(this.appToken))) : " ";
+        lines.push(this.overlay.frameLine(`  ${displayToken}${this.overlay.fg("dim", "█")}`, innerWidth));
+        lines.push(this.overlay.frameLine("", innerWidth));
+        lines.push(this.overlay.frameLine(this.overlay.fg("dim", "Found in Gotify → Apps → your app"), innerWidth));
+        lines.push(this.overlay.ruleLine(innerWidth));
+        lines.push(this.overlay.frameLine(this.overlay.fg("dim", "enter/tab continue · esc cancel"), innerWidth));
+        break;
+      }
+
+      case "priority":
+        lines.push(this.overlay.frameLine(this.overlay.fg("dim", "Set notification priority (1-10):"), innerWidth));
+        lines.push(this.overlay.frameLine("", innerWidth));
+        lines.push(this.overlay.frameLine(`  ${this.overlay.fg("accent", this.overlay.bold(this.priority || " "))}${this.overlay.fg("dim", "█")}`, innerWidth));
+        lines.push(this.overlay.frameLine("", innerWidth));
+        lines.push(this.overlay.frameLine(`  ${this.overlay.fg("dim", "1")} = low · ${this.overlay.fg("dim", "5")} = normal · ${this.overlay.fg("dim", "10")} = high`, innerWidth));
+        lines.push(this.overlay.ruleLine(innerWidth));
+        lines.push(this.overlay.frameLine(this.overlay.fg("dim", "enter/tab test · esc cancel"), innerWidth));
+        break;
+
+      case "testing":
+        lines.push(this.overlay.frameLine("", innerWidth));
+        lines.push(this.overlay.frameLine(`  ${this.overlay.fg("accent", "⠋")} ${this.overlay.bold("Testing connection...")}`, innerWidth));
+        lines.push(this.overlay.frameLine("", innerWidth));
+        lines.push(this.overlay.frameLine(`  ${this.overlay.fg("dim", `Sending test to ${this.serverUrl}`)}`, innerWidth));
+        lines.push(this.overlay.ruleLine(innerWidth));
+        lines.push(this.overlay.frameLine(this.overlay.fg("dim", "Esc to cancel"), innerWidth));
+        break;
+
+      case "success":
+        lines.push(this.overlay.frameLine("", innerWidth));
+        lines.push(this.overlay.frameLine(`  ${this.overlay.fg("success", "✓ Gotify configured successfully!")}`, innerWidth));
+        lines.push(this.overlay.frameLine("", innerWidth));
+        lines.push(this.overlay.frameLine(`  ${this.overlay.fg("dim", `Server: ${this.serverUrl}`)}`, innerWidth));
+        lines.push(this.overlay.frameLine(`  ${this.overlay.fg("dim", `Priority: ${this.priority}`)}`, innerWidth));
+        lines.push(this.overlay.ruleLine(innerWidth));
+        lines.push(this.overlay.frameLine(this.overlay.fg("dim", "Closing..."), innerWidth));
+        break;
+
+      case "test-failed":
+        lines.push(this.overlay.frameLine("", innerWidth));
+        lines.push(this.overlay.frameLine(`  ${this.overlay.fg("error", "✗ Connection test failed")}`, innerWidth));
+        lines.push(this.overlay.frameLine("", innerWidth));
+        lines.push(this.overlay.frameLine(`  ${this.overlay.fg("dim", this.testError || "Unknown error")}`, innerWidth));
+        lines.push(this.overlay.frameLine("", innerWidth));
+        lines.push(this.overlay.frameLine(`  ${this.overlay.fg("dim", "Check your server URL and app token")}`, innerWidth));
+        lines.push(this.overlay.ruleLine(innerWidth));
+        lines.push(this.overlay.frameLine(this.overlay.fg("dim", "Press Enter to close"), innerWidth));
+        break;
+
+      case "error":
+        lines.push(this.overlay.frameLine("", innerWidth));
+        lines.push(this.overlay.frameLine(`  ${this.overlay.fg("error", "✗ Setup failed")}`, innerWidth));
+        lines.push(this.overlay.frameLine("", innerWidth));
+        lines.push(this.overlay.frameLine(`  ${this.overlay.fg("dim", this.error || "Unknown error")}`, innerWidth));
+        lines.push(this.overlay.ruleLine(innerWidth));
+        lines.push(this.overlay.frameLine(this.overlay.fg("dim", "Press Enter to close"), innerWidth));
+        break;
+    }
+
+    lines.push(this.overlay.borderLine(innerWidth, "bottom"));
+    return lines;
+  }
+}
